@@ -1,2 +1,3 @@
-# skills
-Skill repository for FIGLAB team
+# FIGLAB Skills
+
+This is a AI skill repository for FIGLAB team.
