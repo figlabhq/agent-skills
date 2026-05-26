@@ -39,6 +39,66 @@ final class CreateEnrollmentAction
 
 A controller method with 1–2 simple queries plus an Action call is fine. Extract to an Action when you have: multiple mutations, orchestration across services, or logic that will plausibly be reused.
 
+### Actions and Queries hold execution, not guards
+
+An Action/Query is the **execution step**. By the time data reaches it, that data is already trusted: shape-validated, type-cast, authorized, and business-rule-checked. The Action's job is to *do the thing*, not to argue about whether the thing should be done.
+
+This means **no guards inside Actions or Queries** — no auth checks, no "does this user own this record" checks, no "is this status transition allowed" checks, no defensive `throw` statements for conditions the caller could have prevented. All of that belongs in the layer that calls the Action: the controller, the parent Action, the command handler, the job — whoever owns the decision to invoke it.
+
+```php
+// AVOID — guards mixed into the Action
+final class PublishCourseAction
+{
+    public function execute(Course $course, User $actor): void
+    {
+        if ($actor->cannot('publish', $course)) {
+            throw new AuthorizationException();
+        }
+        if ($course->status !== CourseStatus::Draft) {
+            throw new InvalidStateException('Only draft courses can be published.');
+        }
+        if ($course->chapters()->count() === 0) {
+            throw new ValidationException('Course needs at least one chapter.');
+        }
+
+        $course->status = CourseStatus::Published;
+        $course->published_at = now();
+        $course->save();
+    }
+}
+
+// PREFERRED — Action is purely the execution
+final class PublishCourseAction
+{
+    public function execute(Course $course): void
+    {
+        $course->status = CourseStatus::Published;
+        $course->published_at = now();
+        $course->save();
+    }
+}
+
+// Guards live where the decision is made — the controller, policy, form request, or parent action
+public function publish(Course $course, PublishCourseAction $action): RedirectResponse
+{
+    $this->authorize('publish', $course);                          // authorization
+    Gate::denyIf($course->status !== CourseStatus::Draft);         // state guard
+    Gate::denyIf($course->chapters()->doesntExist(), 'No chapters'); // business rule
+
+    $action->execute($course);
+
+    return redirect()->route('courses.show', $course);
+}
+```
+
+Why this matters:
+
+- **One responsibility per layer.** Mixing validation with execution makes Actions hard to test (every test has to satisfy the guards before reaching the behavior under test) and hard to reuse (a queued job, a console command, an admin override may have *different* guard rules — but the same execution).
+- **Guards move toward the boundary.** Authorization belongs in Policies/Form Requests; state checks belong with the business decision; shape validation belongs in the Request/DTO. Pushing them into the Action duplicates them or hides them.
+- **Exceptions stop being a control-flow tool.** When Actions throw guard exceptions, callers start catching them to branch on — and now the "happy path" and "rejected path" both flow through `try/catch`. Decisions made up front in plain `if` statements are easier to read and easier to test.
+
+If you find yourself wanting to put a guard inside an Action, the question to ask is: *who knew this could fail, and why didn't they check before calling me?* That's where the guard belongs.
+
 ### Create models with `new Model()` + property assignment, not `Model::create([...])`
 
 ```php
@@ -108,22 +168,22 @@ If an endpoint serves the data you need, extend or reuse it. Parallel endpoints 
 
 ## DTOs and Request Validation
 
-### Use DTOs (Spatie Laravel Data), not arrays, for Action inputs
+### Validate input with Laravel Form Request classes — not DTOs, not inline rules
 
-Use the `Data` suffix (e.g., `StudentProfileData extends Data`). Passing arrays into Actions defeats the whole point: you lose types, lose IDE support, lose validation at the boundary, and gain nothing.
+Validation at the HTTP boundary belongs in a dedicated **Form Request** class (`StoreCommentRequest extends FormRequest`). Don't use:
 
-### Always use validated data, never raw input
+- **Spatie Laravel Data / other DTO libraries for validation.** DTOs are transport objects. Coupling validation rules into the same class that travels around the application mixes two concerns — the validation runs only at the boundary, but the rules live on a class that gets passed into Actions, jobs, and tests where they're irrelevant noise.
+- **Inline `$request->validate([...])` in the controller.** Validation logic in the controller body bloats the method, hides the contract of the endpoint, and can't be reused or extended (e.g., adding authorization, custom messages, `prepareForValidation`). The controller should describe *what to do once data is valid*, not *what valid data looks like*.
 
 ```php
-// PREFERRED — Form Request
+// PREFERRED — Form Request owns the rules, controller is clean
 public function store(StoreCommentRequest $request, StoreCommentAction $action): RedirectResponse
 {
-    $validatedData = $request->validated();
-    $action->execute($validatedData);
+    $action->execute(CommentData::from($request->validated()));
     return redirect()->back();
 }
 
-// PREFERRED — inline validation
+// AVOID — inline validation in the controller
 public function store(Request $request, StoreCommentAction $action): RedirectResponse
 {
     $validatedData = $request->validate([
@@ -133,15 +193,28 @@ public function store(Request $request, StoreCommentAction $action): RedirectRes
     return redirect()->back();
 }
 
-// AVOID
+// AVOID — raw input, no validation contract
 $action->execute($request->input('text'));
 ```
 
-`$request->input()` returns whatever the client sent, including fields you didn't ask for and types you didn't expect. `validated()` returns only the allow-listed, cast values.
+Why Form Requests:
 
-### Don't force type conversions inside the Request class
+- **One place to find the contract.** A reader looking up "what does this endpoint accept?" opens one file with `rules()`, `authorize()`, custom messages, and `prepareForValidation()` all together.
+- **Authorization belongs with validation.** `authorize()` runs before `rules()`. Putting both on the Form Request keeps the gate next to the door.
+- **Composable.** Form Requests can extend a base class, share rules, override messages per locale, and be unit-tested without booting the controller.
+- **`$request->input()` returns whatever the client sent**, including fields you didn't ask for and types you didn't expect. `$request->validated()` returns only the allow-listed, cast values.
 
-Request classes describe *what's valid*. If you need to transform a string into an enum, parse a date, or hydrate a DTO, that belongs in the Action — where the conversion is testable and reusable.
+The one acceptable exception is a *trivial* endpoint with no inputs beyond a route parameter (e.g., a `destroy` action that takes only the bound model). No Form Request is needed there because there's nothing to validate.
+
+### DTOs are for transport into Actions, not for validation
+
+Once data is validated by the Form Request, hydrate a DTO (e.g., Spatie Laravel Data with the `Data` suffix: `CommentData extends Data`) from the validated array and pass *that* to the Action. The DTO carries typed, structured data through the application. It does **not** carry validation rules — those stayed at the boundary, in the Form Request, where they belong.
+
+Passing raw arrays into Actions defeats the point: you lose types, lose IDE support, and force every Action to re-derive what shape its input has.
+
+### Don't force type conversions inside the Form Request
+
+Form Requests describe *what's valid*. If you need to transform a string into an enum, parse a date, or hydrate a DTO from the validated array, that belongs in the Action (or in the DTO's own constructor / `from()` method) — where the conversion is testable and reusable across entry points that don't go through the same Form Request.
 
 ### Send actual booleans from the frontend
 
@@ -246,8 +319,70 @@ final class CreateCourseActionTest extends TenantTestCase
 - **`#[Test]` attribute + snake_case method names** — reads as natural-language behavior descriptions.
 - **`$this->app->make(...)`** for the system under test, not `new Class()`. The container injects dependencies and surfaces wiring issues your tests should catch.
 - **Factories** for test data. Inline `Model::create([...])` in tests duplicates schema knowledge across hundreds of files.
-- **Duplication in arrange steps is OK.** Two tests with similar setup are easier to read and modify independently than one test backed by a shared helper that takes seven arguments. Extract only when the duplication actually hurts.
 - **No useless tests.** A test that would pass on a broken implementation is worse than no test — it provides false confidence and adds maintenance load.
+
+### Every test stands alone — no shared arrange helpers
+
+Treat each test as a self-contained piece of code. The **arrange** step (creating users, tenants, courses, fixtures, whatever the test needs) is written *in the test itself*, even when several tests in the file need almost the same setup.
+
+That means **no** reusable test helpers for arrange logic:
+
+- No `setUpCourseWithChapters()` private methods on the test class.
+- No `WithBillingScenario` / `CreatesEnrolledStudents` traits mixed into many test classes.
+- No shared `TestDataBuilder` / `Scenario` objects that hide what's actually being created.
+
+Factories (e.g., `Course::factory()->create([...])`) are fine — they're the per-model construction primitive. What we avoid is the *next layer up*: helpers that compose multiple factories into business scenarios and get shared across tests.
+
+```php
+// AVOID — shared trait hides what each test is actually testing
+trait CreatesEnrolledStudent
+{
+    protected function enrolledStudent(Course $course = null): Student
+    {
+        $course ??= Course::factory()->published()->create();
+        $student = Student::factory()->create();
+        Enrollment::factory()->for($student)->for($course)->create();
+        return $student;
+    }
+}
+
+#[Test]
+public function completes_chapter(): void
+{
+    $student = $this->enrolledStudent();
+    // ... what course? what state? reader has to jump to the trait
+}
+
+// PREFERRED — every relevant fact lives in the test
+#[Test]
+public function completes_chapter(): void
+{
+    // Arrange
+    $course = Course::factory()->published()->create();
+    $chapter = Chapter::factory()->for($course)->create();
+    $student = Student::factory()->create();
+    Enrollment::factory()->for($student)->for($course)->create();
+
+    // Act
+    $this->app->make(CompleteChapterAction::class)->execute($student, $chapter);
+
+    // Assert
+    $this->assertDatabaseHas('course__chapter_progress', [
+        'student_id' => $student->id,
+        'chapter_id' => $chapter->id,
+        'completed_at' => now(),
+    ]);
+}
+```
+
+Why duplication in tests is the *right* tradeoff:
+
+- **A test is documentation of one behavior.** When the arrange step is inline, the reader sees every precondition that matters. With a shared helper, the meaningful preconditions are buried under abstraction and the test reads as "do the magic setup, then assert".
+- **Shared test helpers couple unrelated tests.** Today's `enrolledStudent()` returns a published course. Tomorrow someone needs a draft course. They add a flag. Six months later the helper takes nine optional arguments, every change to it risks breaking distant tests, and nobody can read it.
+- **The cost of duplication in tests is low.** Tests rarely "refactor" — when a test fails after a code change, you usually want to update that one test, not propagate a change through a shared scenario builder. Duplicated arrange code makes each test independent to update.
+- **Tests are read far more than they're written.** Optimize for the reader landing on a single failing test and understanding it from top to bottom, not for the writer saving a few lines.
+
+If the same arrange block genuinely repeats across many tests in a single file, a small private method *on that test class* (not a trait, not a shared base) is acceptable — but the default is to write it out every time. The pain of duplication is the signal that tells you when the underlying production code is missing a useful seam, not a signal to build a test-side abstraction.
 
 ---
 
@@ -411,5 +546,7 @@ A quick "did I do anything from this list?" pass before opening a PR catches mos
 28. Useless tests (would pass on a broken implementation).
 29. `$request->input(...)` instead of `$request->validated()`.
 30. Raw `where()` where a scope already exists for that filter.
+31. Inline `$request->validate([...])` in a controller instead of a Form Request class.
+32. DTO library (Spatie Data, etc.) used as the validator instead of a Form Request.
 
 If you wrote one of these, fix it before requesting review. "Self-review before requesting review" is the single highest-leverage habit — multiple review rounds with the same class of issue means insufficient self-review, not a strict reviewer.
