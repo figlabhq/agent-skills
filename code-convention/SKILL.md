@@ -164,25 +164,74 @@ When you can configure a behavior instead of branching on platform/vendor/provid
 
 If an endpoint serves the data you need, extend or reuse it. Parallel endpoints that return overlapping data drift apart over time.
 
+### [Strict] Resolve dependencies by injection, never with the `app()` helper
+
+When you need an instance of a class — an Action, a Query, a service, a repository — **inject it**. Type-hint it as a constructor parameter (for classes the container builds) or a method parameter (controllers, jobs, command `handle()` methods), and let the service container hand it to you.
+
+```php
+// PREFERRED — constructor injection
+final class CheckoutController extends Controller
+{
+    public function __construct(
+        private readonly ProcessPaymentAction $processPayment,
+    ) {}
+
+    public function store(StoreCheckoutRequest $request): RedirectResponse
+    {
+        $this->processPayment->execute(CheckoutData::from($request->validated()));
+        return redirect()->route('orders.index');
+    }
+}
+
+// PREFERRED — method injection (controllers, jobs, commands)
+public function store(StoreCheckoutRequest $request, ProcessPaymentAction $action): RedirectResponse
+{
+    $action->execute(CheckoutData::from($request->validated()));
+    return redirect()->route('orders.index');
+}
+
+// AVOID — the app() helper
+$action = app(ProcessPaymentAction::class);
+$action->execute($data);
+
+// AVOID — new-ing it up bypasses the container entirely
+$action = new ProcessPaymentAction(new PaymentGateway(config('services.stripe.secret')));
+```
+
+Why injection over `app()`:
+
+- **The dependency is visible in the signature.** Anyone reading the constructor sees exactly what the class needs. `app()` calls are scattered through method bodies, hiding the real dependency graph and making the class lie about what it requires.
+- **It's testable.** Injected dependencies can be swapped for fakes/mocks in tests without touching the container. `app()` reaches into global state, so a test has to bind into the container to control it — more setup, more coupling.
+- **It fails loudly and early.** If the container can't build an injected dependency, you find out at resolution time with a clear stack trace, not deep inside a method when `app()` finally runs.
+
+If a situation genuinely makes injection impossible — resolving conditionally at runtime, inside a closure the container doesn't manage, breaking a circular dependency — fall back to `App::make(...)` (the explicit facade, with a `use Illuminate\Support\Facades\App;` import) rather than the `app()` helper. Treat this as the rare exception, not a convenience: if you're reaching for it, first ask whether the class could have been injected instead. Avoid `new Class()` for anything with dependencies — it bypasses the container, so bindings, singletons, and decorators don't apply.
+
 ---
 
 ## DTOs and Request Validation
 
+### Use DTOs (Spatie Laravel Data), not arrays, for Action inputs
 ### Validate input with Laravel Form Request classes — not DTOs, not inline rules
 
+Use the `Data` suffix (e.g., `StudentProfileData extends Data`). Passing arrays into Actions defeats the whole point: you lose types, lose IDE support, lose validation at the boundary, and gain nothing.
 Validation at the HTTP boundary belongs in a dedicated **Form Request** class (`StoreCommentRequest extends FormRequest`). Don't use:
 
+### Always use validated data, never raw input
 - **Spatie Laravel Data / other DTO libraries for validation.** DTOs are transport objects. Coupling validation rules into the same class that travels around the application mixes two concerns — the validation runs only at the boundary, but the rules live on a class that gets passed into Actions, jobs, and tests where they're irrelevant noise.
 - **Inline `$request->validate([...])` in the controller.** Validation logic in the controller body bloats the method, hides the contract of the endpoint, and can't be reused or extended (e.g., adding authorization, custom messages, `prepareForValidation`). The controller should describe *what to do once data is valid*, not *what valid data looks like*.
 
 ```php
+// PREFERRED — Form Request
 // PREFERRED — Form Request owns the rules, controller is clean
 public function store(StoreCommentRequest $request, StoreCommentAction $action): RedirectResponse
 {
+    $validatedData = $request->validated();
+    $action->execute($validatedData);
     $action->execute(CommentData::from($request->validated()));
     return redirect()->back();
 }
 
+// PREFERRED — inline validation
 // AVOID — inline validation in the controller
 public function store(Request $request, StoreCommentAction $action): RedirectResponse
 {
@@ -193,10 +242,12 @@ public function store(Request $request, StoreCommentAction $action): RedirectRes
     return redirect()->back();
 }
 
+// AVOID
 // AVOID — raw input, no validation contract
 $action->execute($request->input('text'));
 ```
 
+`$request->input()` returns whatever the client sent, including fields you didn't ask for and types you didn't expect. `validated()` returns only the allow-listed, cast values.
 Why Form Requests:
 
 - **One place to find the contract.** A reader looking up "what does this endpoint accept?" opens one file with `rules()`, `authorize()`, custom messages, and `prepareForValidation()` all together.
@@ -204,8 +255,10 @@ Why Form Requests:
 - **Composable.** Form Requests can extend a base class, share rules, override messages per locale, and be unit-tested without booting the controller.
 - **`$request->input()` returns whatever the client sent**, including fields you didn't ask for and types you didn't expect. `$request->validated()` returns only the allow-listed, cast values.
 
+### Don't force type conversions inside the Request class
 The one acceptable exception is a *trivial* endpoint with no inputs beyond a route parameter (e.g., a `destroy` action that takes only the bound model). No Form Request is needed there because there's nothing to validate.
 
+Request classes describe *what's valid*. If you need to transform a string into an enum, parse a date, or hydrate a DTO, that belongs in the Action — where the conversion is testable and reusable.
 ### DTOs are for transport into Actions, not for validation
 
 Once data is validated by the Form Request, hydrate a DTO (e.g., Spatie Laravel Data with the `Data` suffix: `CommentData extends Data`) from the validated array and pass *that* to the Action. The DTO carries typed, structured data through the application. It does **not** carry validation rules — those stayed at the boundary, in the Form Request, where they belong.
@@ -319,6 +372,7 @@ final class CreateCourseActionTest extends TenantTestCase
 - **`#[Test]` attribute + snake_case method names** — reads as natural-language behavior descriptions.
 - **`$this->app->make(...)`** for the system under test, not `new Class()`. The container injects dependencies and surfaces wiring issues your tests should catch.
 - **Factories** for test data. Inline `Model::create([...])` in tests duplicates schema knowledge across hundreds of files.
+- **Duplication in arrange steps is OK.** Two tests with similar setup are easier to read and modify independently than one test backed by a shared helper that takes seven arguments. Extract only when the duplication actually hurts.
 - **No useless tests.** A test that would pass on a broken implementation is worse than no test — it provides false confidence and adds maintenance load.
 
 ### Every test stands alone — no shared arrange helpers
@@ -548,5 +602,6 @@ A quick "did I do anything from this list?" pass before opening a PR catches mos
 30. Raw `where()` where a scope already exists for that filter.
 31. Inline `$request->validate([...])` in a controller instead of a Form Request class.
 32. DTO library (Spatie Data, etc.) used as the validator instead of a Form Request.
+33. `app(...)` helper (or `new Class()`) to resolve a dependency instead of injecting it.
 
 If you wrote one of these, fix it before requesting review. "Self-review before requesting review" is the single highest-leverage habit — multiple review rounds with the same class of issue means insufficient self-review, not a strict reviewer.
