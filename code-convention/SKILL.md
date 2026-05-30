@@ -545,6 +545,30 @@ Library/package code and SDK surfaces are the exception — a class or method th
 - **Persist form state with fallbacks** — when the user navigates away and back, they shouldn't lose their work to a hydration race.
 - **Gate features by who should see them** (paid, trial, admin) rather than rendering and disabling.
 
+### Never use emojis as icons
+
+An emoji (🔍 ✅ ⚙️ 🗑️) is not an icon. Use a real icon from the project's icon library (Lucide, Heroicons, Font Awesome, a local SVG sprite — whatever the project standardized on). Emojis render inconsistently across platforms and fonts (Apple, Windows, Android, and Linux each draw them differently), can't be styled with `currentColor` / size utilities, carry no reliable accessible name, and look amateur next to a real icon set. They're for human-written text (chat, copy, commit messages), not UI chrome.
+
+```jsx
+// AVOID — emoji standing in for an icon
+<button>🗑️ Delete</button>
+<span>✅ Saved</span>
+
+// PREFERRED — icon component from the library
+import { Trash2, Check } from 'lucide-react';
+
+<button><Trash2 className="size-4" aria-hidden /> Delete</button>
+<span><Check className="size-4 text-green-600" aria-hidden /> Saved</span>
+```
+
+The same applies in Blade (`<x-icon name="trash" />` or an `@svg` directive) — reach for the icon component, not a literal emoji character.
+
+If the project has **no** icon library, don't reach for an emoji as a shortcut. Either:
+1. **Ask the user to install one** (e.g., `lucide-react`, Blade Icons) and use it — this is the preferred path since the whole app then shares one consistent, styleable set; or
+2. **Inline an SVG** for the one icon you need right now, ideally pulled from an open icon set so it matches the rest visually.
+
+Flag the missing library to the user rather than silently working around it — picking the icon system is a project-level decision worth surfacing.
+
 ---
 
 ## Config
@@ -603,5 +627,6 @@ A quick "did I do anything from this list?" pass before opening a PR catches mos
 31. Inline `$request->validate([...])` in a controller instead of a Form Request class.
 32. DTO library (Spatie Data, etc.) used as the validator instead of a Form Request.
 33. `app(...)` helper (or `new Class()`) to resolve a dependency instead of injecting it.
+34. Emoji used as a UI icon instead of an icon-library component or SVG.
 
 If you wrote one of these, fix it before requesting review. "Self-review before requesting review" is the single highest-leverage habit — multiple review rounds with the same class of issue means insufficient self-review, not a strict reviewer.
