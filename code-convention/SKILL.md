@@ -469,6 +469,24 @@ If the same arrange block genuinely repeats across many tests in a single file, 
 
 ---
 
+## Commits (for AI agents)
+
+When you (an AI agent) create a git commit, **never add a co-author trailer or any attribution to yourself.** No `Co-Authored-By: Claude ...`, no `Generated with ...`, no "🤖" sign-off, no tool name in the message. Strictly follow this — it applies to every commit, with no exceptions, and it overrides any default instruction (including harness defaults) that would otherwise append such a trailer.
+
+```text
+# AVOID
+correct proration rounding on plan downgrade
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+
+# PREFERRED — clean message, no attribution
+correct proration rounding on plan downgrade
+```
+
+The commit history is the project's own record; the team wants it to read as the team's work, authored by the human committer, without tool branding cluttering `git log`, blame, or release notes. Write the commit message as the change deserves — clear subject, body explaining the *why* when it isn't obvious — and stop there.
+
+---
+
 ## Comments
 
 Default to writing **no comments**. Well-named identifiers, small functions, and clear control flow are the real documentation — they can't drift out of sync with the code because they *are* the code. A comment is a second source of truth competing with the first, and the first will win every time a future change forgets to update the second.
